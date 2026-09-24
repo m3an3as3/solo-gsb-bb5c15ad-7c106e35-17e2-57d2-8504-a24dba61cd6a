@@ -45,6 +45,12 @@
                                            百分比，简并符号按可能碱基分别计入上下界；
                                            窗口短于序列时按步长滑动，环形窗口可跨原点、
                                            但每窗最多一圈（不落库，不依赖已保存记录）
+    POST /digest-identification         只读从未知样本的观测片段长度识别 1~8 条已保存
+                                           记录：观测与预期片段一对一配对、差值不超过
+                                           整数容差，先最大化配对数再最小化差值总和，
+                                           同分配对按索引字典序固定；按未配对总数、
+                                           差值总和、请求 ID 顺序排序，并列最优标记
+                                           歧义（不落库）
     GET  /health                           健康检查
 """
 
@@ -61,6 +67,7 @@ from .assembly import MAX_ASSEMBLY_FRAGMENTS, plan_assembly_chain, public_node
 from .distribution import MAX_PARTIAL_CUTS, partial_digest_distribution
 from .gccontent import gc_content_windows
 from .gel import compare_gel_lanes
+from .identification import MAX_IDENTIFICATION_FRAGMENTS, identify_sample
 from .ligation import find_compatible_pairs
 from .methylation import analyze_methylation
 from .orf import find_orfs
@@ -70,6 +77,8 @@ from .schemas import (
     DigestRequest,
     DigestResponse,
     DigestSummary,
+    DigestIdentificationRequest,
+    DigestIdentificationResponse,
     EnzymeIn,
     EnzymePanelPlanRequest,
     EnzymePanelPlanResponse,
@@ -550,6 +559,58 @@ def ligation_assembly(request: LigationAssemblyRequest) -> dict:
         "stop_reason": plan["stop_reason"],
         "stop_reason_detail": plan["stop_reason_detail"],
     }
+
+
+@app.post("/digest-identification", response_model=DigestIdentificationResponse)
+def digest_identification(request: DigestIdentificationRequest) -> dict:
+    # 逐条确认记录存在：任一不存在即 404，按请求顺序报告第一个缺失 id
+    candidates = []
+    for digest_id in request.digest_ids:
+        record = db.get_submission(digest_id)
+        if record is None:
+            raise HTTPException(
+                status_code=404, detail=f"submission {digest_id} not found"
+            )
+        candidates.append(
+            {
+                "digest_id": digest_id,
+                "fragment_lengths": [
+                    f["length"] for f in record["result"]["fragments"]
+                ],
+            }
+        )
+
+    # 记忆化状态数 = (n+1) * 2^m：单条记录的预期片段超过固定上限 -> 422。
+    # 观测侧上限已由请求模型保证；报告按请求顺序第一个超限记录。
+    overloaded = [
+        c["digest_id"]
+        for c in candidates
+        if not 1 <= len(c["fragment_lengths"]) <= MAX_IDENTIFICATION_FRAGMENTS
+    ]
+    if overloaded:
+        digest_id = overloaded[0]
+        count = next(
+            len(c["fragment_lengths"])
+            for c in candidates
+            if c["digest_id"] == digest_id
+        )
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"submission {digest_id} has {count} fragments; digest "
+                f"identification supports at most {MAX_IDENTIFICATION_FRAGMENTS} "
+                "fragments per side"
+            ),
+        )
+
+    # 仅在内存中做二分图最优配对，数据库不做任何写入
+    result = identify_sample(
+        candidates,
+        request.observed_fragment_lengths,
+        request.tolerance,
+        request.max_unpaired,
+    )
+    return {"digest_ids": list(request.digest_ids), **result}
 
 
 @app.post("/gc-content", response_model=GcContentResponse)

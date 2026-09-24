@@ -76,6 +76,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `POST` | `/ligation-compatibility` | 只读枚举 2~8 条已保存记录之间可连接的片段末端对：黏端要求一方 5' 突出端序列等于另一方 3' 突出端序列的反向互补，平端仅与平端兼容（可通过 `include_blunt` 关闭），返回按记录/片段/端方向稳定排序的配对、兼容类型、连接后突出端与总数（不落库，记录不存在返回 404） |
 | `POST` | `/ligation-assembly` | 只读规划 2~8 条已保存记录之间的最长片段拼接链：复用末端反向互补兼容判定构建有向图，搜索不重复使用记录的最长线性链（每条记录最多贡献一个片段，可正向/反向摆入，`max_chain_length` 限制链上节点数），同长度方案按记录请求顺序、片段索引与端方向稳定择优，返回节点端点、连接类型/突出端、总连接数与未能延伸的原因（不落库，记录不存在返回 404，候选片段过多返回 422） |
 | `POST` | `/gc-content` | 只读对提交的 IUPAC 序列按固定窗口计算 GC 含量范围：每窗口返回确定碱基贡献的最低/最高 GC 计数与百分比，简并符号按其可能碱基分别计入上/下界；窗口短于序列时按指定步长滑动，环形窗口可跨越末尾回到开头且每个窗口最多覆盖一圈（不落库，不依赖已保存记录） |
+| `POST` | `/digest-identification` | 只读从未知样本的观测片段长度识别 1~8 条已保存记录：观测与预期片段一对一配对、长度差不超过整数 bp 容差，先最大化配对数再最小化差值总和，同分配对按索引字典序固定；候选按未配对总数、差值总和、请求 ID 顺序排序，最优分数并列标记歧义，无候选满足最大未配对数时返回无命中（不落库） |
 | `GET` | `/health` | 健康检查 |
 
 ### 提交示例
@@ -1014,6 +1015,136 @@ curl -X POST http://localhost:8000/gc-content \
 | 序列为空，或含非 IUPAC 字符 | **422** |
 | `topology` 不是 `linear` / `circular` | **422** |
 
+## 未知样本识别（酶切片段长度配对）
+
+只读从**未知样本的观测片段长度**（如凝胶上读得的条带长度）出发，对
+**1~8 条已保存记录**逐一做**观测片段 ↔ 预期酶切片段**的一对一配对，按统一
+分数排序并给出命中与歧义判定。**识别过程不写库**：原记录保持不变，也不会
+产生新的提交。
+
+### 配对与择优口径
+
+- 观测列表与某条记录的预期片段列表各以**列表索引**（0-based）标识片段；
+  **重复长度按不同片段计数**（不做多重集折叠）。
+- 一个观测与一个预期**至多配对一次**（任一片段都不能被两个配对复用），
+  配对当且仅当 **`|observed_length - expected_length| <= tolerance`**
+  （整数 bp，闭区间）。
+- 对每条候选记录，优化目标依次为：
+  1. **最大化配对数**；
+  2. 配对数相同则**最小化差值总和**（配对的长度差之和）；
+  3. 仍相同时，把配对按（观测索引, 预期索引）排序得到配对序列，取
+     **字典序最小**的方案：编号更小的观测优先被配出（未配对因此集中在
+     编号最大的观测上），被配出的观测优先占用编号最小的可行预期。
+- **未配对总数** = 观测未配对数 + 预期未配对数。
+- 候选之间按 **（未配对总数, 差值总和, 请求中的 id 顺序）** 升序排序。
+- `max_unpaired` 为命中门槛：未配对总数**不超过**该值的候选才算命中；
+  无候选满足时返回**无命中**。命中候选中最优分数
+  （未配对总数, 差值总和）被多个候选并列时标记**歧义**，`best_digest_id`
+  取请求顺序最靠前的并列候选作为代表。
+- 每侧至多 **12** 个片段（观测列表与单条记录的预期片段均受此限），
+  超出返回 422。
+
+### 请求
+
+```bash
+curl -X POST http://localhost:8000/digest-identification \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "digest_ids": [1, 2],
+    "observed_fragment_lengths": [100, 200, 305],
+    "tolerance": 10,
+    "max_unpaired": 2
+  }'
+```
+
+- `digest_ids`：1~8 个已保存记录 id，不可重复；顺序参与候选排序与歧义时
+  代表 id 的选取。
+- `observed_fragment_lengths`：未知样本的观测片段长度（bp），1~12 个
+  **正整数**，重复长度按不同片段计数。
+- `tolerance`：允许配对的最大长度差（bp，含），**非负整数**。
+- `max_unpaired`：命中所允许的两侧未配对片段总数上限（含），**非负整数**。
+
+### 响应
+
+下例中 `id=1` 的记录片段为 `[100, 200, 300]`（3 对、差值 5、0 未配对，
+命中且唯一最优），`id=2` 的记录片段为 `[100, 200, 400]`（2 对，观测 305
+与预期 400 均未配对，共 2 个未配对但差值为 0）：
+
+```json
+{
+  "digest_ids": [1, 2],
+  "observed_fragment_lengths": [100, 200, 305],
+  "tolerance": 10,
+  "max_unpaired": 2,
+  "candidate_count": 2,
+  "hit": true,
+  "ambiguous": false,
+  "best_digest_id": 1,
+  "candidates": [
+    {
+      "digest_id": 1,
+      "fragment_count": 3,
+      "pair_count": 3,
+      "unpaired_count": 0,
+      "diff_sum": 5,
+      "eligible": true,
+      "best": true,
+      "pairs": [
+        {"observed_index": 0, "expected_index": 0,
+         "observed_length": 100, "expected_length": 100, "length_diff": 0},
+        {"observed_index": 1, "expected_index": 1,
+         "observed_length": 200, "expected_length": 200, "length_diff": 0},
+        {"observed_index": 2, "expected_index": 2,
+         "observed_length": 305, "expected_length": 300, "length_diff": 5}
+      ],
+      "unpaired_observed_indices": [],
+      "unpaired_expected_indices": []
+    },
+    {
+      "digest_id": 2,
+      "fragment_count": 3,
+      "pair_count": 2,
+      "unpaired_count": 2,
+      "diff_sum": 0,
+      "eligible": true,
+      "best": false,
+      "pairs": [
+        {"observed_index": 0, "expected_index": 0,
+         "observed_length": 100, "expected_length": 100, "length_diff": 0},
+        {"observed_index": 1, "expected_index": 1,
+         "observed_length": 200, "expected_length": 200, "length_diff": 0}
+      ],
+      "unpaired_observed_indices": [2],
+      "unpaired_expected_indices": [2]
+    }
+  ]
+}
+```
+
+- `hit`：是否存在未配对总数不超过 `max_unpaired` 的候选；无命中时为
+  `false`，同时 `ambiguous` 为 `false`、`best_digest_id` 为 `null`
+  （候选仍全部回显，各自 `eligible` 为 `false`）。
+- `ambiguous`：命中候选中最优分数（未配对总数, 差值总和）被多个候选并列时
+  为 `true`；`best_digest_id` 取请求顺序最靠前的并列候选作为代表，每个
+  并列候选的 `best` 均为 `true`。
+- `candidates[]` 按 **（未配对总数, 差值总和, 请求 ID 顺序）** 稳定排序：
+  - `pairs[]` 按观测索引升序，含两侧索引、长度与 `length_diff`
+    （恒不超过容差）；
+  - `unpaired_observed_indices` / `unpaired_expected_indices`：两侧未配对
+    片段的索引，各自按索引升序；
+  - `eligible`：未配对总数是否不超过 `max_unpaired`（计入命中）。
+
+### 校验与状态码
+
+| 情形 | 状态码 |
+| --- | --- |
+| 任一记录不存在（按请求顺序报告第一个缺失 id） | **404** |
+| `digest_ids` 重复 / 少于 1 条 / 多于 8 条 | **422** |
+| `observed_fragment_lengths` 为空、超过 12 个、含非正整数 | **422** |
+| `tolerance` 或 `max_unpaired` 为负数 / 非整数 / 缺失 | **422** |
+| 某条记录的酶切片段数超过 12（按请求顺序报告第一条） | **422** |
+| 无候选满足 `max_unpaired` | **200**，`hit` 为 `false` |
+
 ## 行为规则
 
 - **双向搜索**：同时在 top 链搜索 `pattern` 与 `reverse_complement(pattern)`
@@ -1044,6 +1175,7 @@ app/
 ├── ligation.py  # 末端连接兼容性分析（跨记录末端对枚举、黏端/平端兼容判定）
 ├── assembly.py  # 片段拼接链规划（有向图、不重复用记录的最长简单路径与稳定择优）
 ├── gccontent.py # 固定窗口 GC 含量范围（简并碱基上下界、线性/环形滑窗）
+├── identification.py # 未知样本识别（观测/预期片段一对一最优配对、字典序择优、命中/歧义判定）
 ├── iupac.py     # IUPAC 编码表与反向互补
 ├── schemas.py   # 请求/响应模型与校验
 └── db.py        # SQLite 持久化（启动时自动建表）
@@ -1059,7 +1191,8 @@ tests/
 ├── test_gel_api.py       # 凝胶条带比较 API 测试
 ├── test_ligation_api.py  # 末端连接兼容性 API 测试
 ├── test_assembly_api.py  # 片段拼接链规划 API 测试
-└── test_gc_content_api.py  # 固定窗口 GC 含量范围 API 测试
+├── test_gc_content_api.py  # 固定窗口 GC 含量范围 API 测试
+└── test_identification_api.py  # 未知样本识别 API 测试
 Dockerfile
 docker-compose.yml
 requirements.txt

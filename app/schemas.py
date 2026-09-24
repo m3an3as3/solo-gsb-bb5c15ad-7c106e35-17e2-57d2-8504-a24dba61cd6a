@@ -781,6 +781,111 @@ class OrfSearchResponse(BaseModel):
     orfs: list[OrfOut]
 
 
+# ---------- 未知样本识别（片段长度配对） ----------
+
+
+class DigestIdentificationRequest(BaseModel):
+    """未知样本识别请求：1~8 条已保存记录 + 观测片段长度 + 容差 + 最大未配对数。
+
+    纯只读计算，读取各记录酶切片段的长度，不引用原始序列、不写库。
+    ``digest_ids`` 不可重复（重复即 422）；``observed_fragment_lengths``
+    为 1~12 个正整数（凝胶上读得的条带长度，重复长度按不同片段计数）；
+    ``tolerance`` 为非负整数（bp）；``max_unpaired`` 为非负整数。
+    记录是否存在、其片段数是否超过 12，均依赖数据库内容，在路由中
+    逐个确认，任一不存在 -> 404。
+    """
+
+    digest_ids: list[int] = Field(min_length=1, max_length=8, examples=[[1, 2]])
+    observed_fragment_lengths: list[Annotated[int, Field(ge=1)]] = Field(
+        min_length=1,
+        max_length=12,
+        description="未知样本的观测片段长度（bp），1~12 个正整数，重复长度按不同片段计数",
+        examples=[[100, 200, 305]],
+    )
+    tolerance: int = Field(
+        ge=0,
+        description="允许配对的最大长度差（bp，含），非负整数",
+        examples=[10],
+    )
+    max_unpaired: int = Field(
+        ge=0,
+        description="命中所允许的两侧未配对片段总数上限（含），非负整数",
+        examples=[2],
+    )
+
+    @model_validator(mode="after")
+    def _no_duplicate_ids(self) -> "DigestIdentificationRequest":
+        seen: set[int] = set()
+        duplicates: set[int] = set()
+        for digest_id in self.digest_ids:
+            if digest_id in seen:
+                duplicates.add(digest_id)
+            seen.add(digest_id)
+        if duplicates:
+            raise ValueError(
+                "duplicate digest ids: "
+                + ", ".join(str(i) for i in sorted(duplicates))
+            )
+        return self
+
+
+class IdentificationPairOut(BaseModel):
+    """一对配对成功的片段：观测/预期索引、长度与差值。
+
+    索引分别对应请求的观测长度列表与 ``GET /digests/{id}`` 结果中的
+    片段索引（0-based，按物理顺序）；``length_diff`` 为
+    ``|observed_length - expected_length|``，恒不超过容差。
+    """
+
+    observed_index: int
+    expected_index: int
+    observed_length: int
+    expected_length: int
+    length_diff: int
+
+
+class IdentificationCandidateOut(BaseModel):
+    """一个候选记录的最优配对结果。
+
+    ``unpaired_count`` 为两侧未配对片段总数
+    （观测数 + 预期数 - 2 × 配对数）；``eligible`` 表示其未超过
+    ``max_unpaired``（计入命中）；``best`` 表示其分数（未配对总数,
+    差值总和）在全部命中候选中并列最优。配对按观测索引升序，
+    未配对索引按各自列表的索引升序。
+    """
+
+    digest_id: int
+    fragment_count: int
+    pair_count: int
+    unpaired_count: int
+    diff_sum: int
+    eligible: bool
+    best: bool
+    pairs: list[IdentificationPairOut]
+    unpaired_observed_indices: list[int]
+    unpaired_expected_indices: list[int]
+
+
+class DigestIdentificationResponse(BaseModel):
+    """识别结果：候选按（未配对总数, 差值总和, 请求 ID 顺序）稳定排序。
+
+    无候选满足 ``max_unpaired`` 时 ``hit`` 为 false、``ambiguous`` 为
+    false、``best_digest_id`` 为 null（无命中）；有命中且最优分数被
+    多个候选并列时 ``ambiguous`` 为 true，``best_digest_id`` 取请求
+    顺序最靠前的并列候选作为代表。
+    """
+
+    digest_ids: list[int]
+    observed_fragment_lengths: list[int]
+    tolerance: int
+    max_unpaired: int
+    candidate_count: int
+    hit: bool
+    ambiguous: bool
+    best_digest_id: int | None
+    candidates: list[IdentificationCandidateOut]
+
+
 # ---------- 固定窗口 GC 含量范围 ----------
 
 
