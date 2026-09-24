@@ -40,6 +40,15 @@
                                            平端连接，max_chain_length 限制链上节点数；
                                            返回节点端点、连接类型/突出端、总连接数与
                                            未能延伸的原因（不落库）
+    POST /digest-identification          只读识别未知样本：对 1~8 条已保存记录，将请求
+                                           给出的观测片段长度与各记录的酶切片段长度做
+                                           二分图配对（差值不超过整数 bp 容差，每片段
+                                           至多配对一次，重复长度按不同片段计数），
+                                           先最大化配对数、再最小化差值总和，同分配对
+                                           按索引字典序固定；按未配对片段总数、差值
+                                           总和、请求 ID 顺序排序返回各候选的配对与
+                                           未配对索引，最优得分并列标记歧义，无候选
+                                           满足最大未配对数时无命中（不落库）
     POST /gc-content                     只读对提交的 IUPAC 序列按固定窗口计算 GC 含量
                                            范围：每窗口返回确定碱基贡献的最低/最高 GC
                                            百分比，简并符号按可能碱基分别计入上下界；
@@ -61,12 +70,15 @@ from .assembly import MAX_ASSEMBLY_FRAGMENTS, plan_assembly_chain, public_node
 from .distribution import MAX_PARTIAL_CUTS, partial_digest_distribution
 from .gccontent import gc_content_windows
 from .gel import compare_gel_lanes
+from .identification import MAX_IDENTIFICATION_FRAGMENTS, identify_candidates
 from .ligation import find_compatible_pairs
 from .methylation import analyze_methylation
 from .orf import find_orfs
 from .panel import plan_enzyme_panel
 from .pcr import predict_pcr_products
 from .schemas import (
+    DigestIdentificationRequest,
+    DigestIdentificationResponse,
     DigestRequest,
     DigestResponse,
     DigestSummary,
@@ -549,6 +561,71 @@ def ligation_assembly(request: LigationAssemblyRequest) -> dict:
         ],
         "stop_reason": plan["stop_reason"],
         "stop_reason_detail": plan["stop_reason_detail"],
+    }
+
+
+@app.post("/digest-identification", response_model=DigestIdentificationResponse)
+def identify_digest(request: DigestIdentificationRequest) -> dict:
+    # 逐条确认记录存在：任一不存在即 404，按请求顺序报告第一个缺失 id
+    records = []
+    for digest_id in request.digest_ids:
+        record = db.get_submission(digest_id)
+        if record is None:
+            raise HTTPException(
+                status_code=404, detail=f"submission {digest_id} not found"
+            )
+        records.append(
+            {
+                "digest_id": digest_id,
+                "fragment_lengths": [
+                    f["length"] for f in record["result"]["fragments"]
+                ],
+            }
+        )
+
+    # 每侧至多 12 个片段：观测侧已由模型校验，记录侧超限则无法在保证
+    # 耗时的前提下求精确最优配对 -> 422
+    for record in records:
+        fragment_count = len(record["fragment_lengths"])
+        if fragment_count > MAX_IDENTIFICATION_FRAGMENTS:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"submission {record['digest_id']} has {fragment_count} "
+                    f"fragments; identification supports at most "
+                    f"{MAX_IDENTIFICATION_FRAGMENTS} fragments per side"
+                ),
+            )
+
+    # 仅在内存中求解最优配对并评分排序，数据库不做任何写入
+    candidates = identify_candidates(
+        records, request.observed_lengths, request.tolerance
+    )
+    hits = [
+        c for c in candidates if c["unmatched_count"] <= request.max_unmatched
+    ]
+    if hits:
+        best_score = (hits[0]["unmatched_count"], hits[0]["total_difference"])
+        best_digest_ids = [
+            c["digest_id"]
+            for c in hits
+            if (c["unmatched_count"], c["total_difference"]) == best_score
+        ]
+    else:
+        best_digest_ids = []
+
+    return {
+        "digest_ids": list(request.digest_ids),
+        "observed_lengths": list(request.observed_lengths),
+        "tolerance": request.tolerance,
+        "max_unmatched": request.max_unmatched,
+        "observed_count": len(request.observed_lengths),
+        "candidate_count": len(candidates),
+        "candidates": candidates,
+        "hit_digest_ids": [c["digest_id"] for c in hits],
+        "hit_count": len(hits),
+        "best_digest_ids": best_digest_ids,
+        "ambiguous": len(best_digest_ids) > 1,
     }
 
 

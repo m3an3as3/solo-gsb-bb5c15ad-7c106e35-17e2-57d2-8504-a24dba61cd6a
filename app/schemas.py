@@ -657,6 +657,93 @@ class LigationAssemblyResponse(BaseModel):
     stop_reason_detail: str
 
 
+# ---------- 未知样本识别 ----------
+
+
+class DigestIdentificationRequest(BaseModel):
+    """未知样本识别请求：1~8 条已保存记录 + 观测片段长度 + 容差 + 最大未配对数。
+
+    digest_ids 不可重复（重复即 422）；observed_lengths 为 1~12 个正整数
+    （观测侧至多 12 个片段）；tolerance / max_unmatched 为非负整数。
+    记录是否存在、记录片段数是否超过 12（预期侧上限）依赖数据库，
+    在路由中取到记录后校验（不存在 -> 404，片段数超限 -> 422）。
+    """
+
+    digest_ids: list[int] = Field(min_length=1, max_length=8, examples=[[1, 2]])
+    observed_lengths: list[Annotated[int, Field(ge=1)]] = Field(
+        min_length=1, max_length=12, examples=[[100, 200]]
+    )
+    tolerance: int = Field(
+        ge=0, description="配对允许的最大长度差（bp，含端点）", examples=[3]
+    )
+    max_unmatched: int = Field(
+        ge=0, description="命中允许的最大未配对片段总数（含）", examples=[1]
+    )
+
+    @model_validator(mode="after")
+    def _no_duplicate_ids(self) -> "DigestIdentificationRequest":
+        seen: set[int] = set()
+        duplicates: set[int] = set()
+        for digest_id in self.digest_ids:
+            if digest_id in seen:
+                duplicates.add(digest_id)
+            seen.add(digest_id)
+        if duplicates:
+            raise ValueError(
+                "duplicate digest ids: "
+                + ", ".join(str(i) for i in sorted(duplicates))
+            )
+        return self
+
+
+class IdentificationPairOut(BaseModel):
+    """一对配对的观测/预期片段：两侧索引、长度与差值（恒 <= tolerance）。"""
+
+    observed_index: int
+    fragment_index: int
+    observed_length: int
+    expected_length: int
+    difference: int
+
+
+class IdentificationCandidateOut(BaseModel):
+    """一个候选记录的识别结果：最优配对、得分与未配对索引。
+
+    unmatched_count 为两侧未配对片段总数（观测侧 + 预期侧）；
+    pairs 按观测索引升序，两个未配对索引列表各自升序。
+    """
+
+    digest_id: int
+    fragment_lengths: list[int]
+    matched_count: int
+    unmatched_count: int
+    total_difference: int
+    pairs: list[IdentificationPairOut]
+    unmatched_observed_indices: list[int]
+    unmatched_fragment_indices: list[int]
+
+
+class DigestIdentificationResponse(BaseModel):
+    """识别结果：候选按（未配对片段总数, 差值总和, 记录请求顺序）升序排列。
+
+    hit_digest_ids 为未配对片段总数不超过 max_unmatched 的候选（沿用同一
+    排序）；best_digest_ids 为其中得分最优者，多于一个时 ambiguous 为
+    true；无候选满足 max_unmatched 时两者均为空、ambiguous 为 false。
+    """
+
+    digest_ids: list[int]
+    observed_lengths: list[int]
+    tolerance: int
+    max_unmatched: int
+    observed_count: int
+    candidate_count: int
+    candidates: list[IdentificationCandidateOut]
+    hit_digest_ids: list[int]
+    hit_count: int
+    best_digest_ids: list[int]
+    ambiguous: bool
+
+
 # ---------- PCR 扩增产物预测 ----------
 
 
